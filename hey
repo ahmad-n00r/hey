@@ -1,0 +1,179 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+AUTHOR="ahmad-n00r"
+START_TS="$(date -Iseconds)"
+
+LOG_DIR="/var/log/hey"
+USER_LOG_DIR="$HOME/.hey/logs"
+STATE_DIR="$HOME/.hey"
+STATE_FILE="$STATE_DIR/state.json"
+LOG_FILE=""
+
+mkdir -p "$LOG_DIR" 2>/dev/null || true
+if [ -w "$LOG_DIR" ]; then
+  LOG_FILE="$LOG_DIR/hey.log"
+else
+  mkdir -p "$USER_LOG_DIR"
+  LOG_FILE="$USER_LOG_DIR/hey.log"
+fi
+
+exec > >(tee -a "$LOG_FILE") 2>&1
+
+echo "[HEY] author=$AUTHOR start=$START_TS"
+
+. /etc/os-release
+
+OS_ID="$ID"
+OS_LIKE="${ID_LIKE:-}"
+ENV_TYPE="bare"
+PKG_MGR=""
+
+grep -qi microsoft /proc/version 2>/dev/null && ENV_TYPE="wsl"
+command -v systemd-detect-virt >/dev/null 2>&1 && [[ "$(systemd-detect-virt)" != "none" ]] && ENV_TYPE="vm"
+
+case "$OS_ID" in
+  kali|parrot|ubuntu|debian) PKG_MGR="apt" ;;
+  arch) PKG_MGR="pacman" ;;
+  *) echo "[HEY] unsupported_os=$OS_ID"; exit 1 ;;
+esac
+
+echo "[HEY] os=$OS_ID env=$ENV_TYPE pkg_mgr=$PKG_MGR"
+
+mkdir -p "$STATE_DIR"
+
+pkg_exists() {
+  if [ "$PKG_MGR" = "apt" ]; then
+    apt-cache show "$1" >/dev/null 2>&1
+  else
+    pacman -Si "$1" >/dev/null 2>&1
+  fi
+}
+
+pkg_installed() {
+  if [ "$PKG_MGR" = "apt" ]; then
+    dpkg -s "$1" >/dev/null 2>&1
+  else
+    pacman -Qi "$1" >/dev/null 2>&1
+  fi
+}
+
+install_pkg() {
+  for p in "$@"; do
+    if pkg_exists "$p"; then
+      if ! pkg_installed "$p"; then
+        if [ "$PKG_MGR" = "apt" ]; then
+          apt install -y "$p"
+        else
+          pacman -S --noconfirm "$p"
+        fi
+        echo "[HEY] installed=$p"
+      else
+        echo "[HEY] present=$p"
+      fi
+      return 0
+    fi
+  done
+  echo "[HEY] skip_no_pkg=$*"
+  return 1
+}
+
+if [ "$PKG_MGR" = "apt" ]; then
+  echo 'Acquire::ForceIPv4 "true";' > /etc/apt/apt.conf.d/99force-ipv4
+  apt --fix-broken install -y || true
+  apt clean
+  apt autoclean
+  apt update -y
+else
+  pacman -Sy --noconfirm
+fi
+
+HN="$(hostname)"
+grep -q "$HN" /etc/hosts || echo "127.0.1.1 $HN" >> /etc/hosts
+
+BASE_PKGS=(ca-certificates curl wget git jq unzip tar tmux vim net-tools iproute2 pciutils usbutils)
+for p in "${BASE_PKGS[@]}"; do install_pkg "$p"; done
+
+NET_PKGS=(network-manager dnsutils iw wireless-tools wpasupplicant rfkill)
+for p in "${NET_PKGS[@]}"; do install_pkg "$p"; done
+
+BT_PKGS=(bluez blueman)
+for p in "${BT_PKGS[@]}"; do install_pkg "$p"; done
+
+AUDIO_PKGS=(pipewire pipewire-audio wireplumber alsa-utils pavucontrol)
+for p in "${AUDIO_PKGS[@]}"; do install_pkg "$p"; done
+
+VIDEO_PKGS=(mesa-utils vainfo vdpauinfo xrandr)
+for p in "${VIDEO_PKGS[@]}"; do install_pkg "$p"; done
+
+install_pkg linux-firmware firmware-linux firmware-linux-nonfree firmware-amd-graphics
+
+command -v nmcli >/dev/null 2>&1 && nmcli networking on || true
+command -v rfkill >/dev/null 2>&1 && rfkill unblock all || true
+command -v resolvectl >/dev/null 2>&1 && resolvectl flush-caches || true
+
+if command -v systemctl >/dev/null 2>&1; then
+  systemctl enable NetworkManager 2>/dev/null || true
+  systemctl start NetworkManager 2>/dev/null || true
+  systemctl enable bluetooth 2>/dev/null || true
+  systemctl start bluetooth 2>/dev/null || true
+  systemctl --user restart pipewire pipewire-pulse wireplumber 2>/dev/null || true
+fi
+
+command -v xrandr >/dev/null 2>&1 && xrandr --auto || true
+
+GPU_VENDOR="none"
+lspci | grep -qi nvidia && GPU_VENDOR="nvidia"
+lspci | grep -qi 'amd\|ati' && GPU_VENDOR="amd"
+lspci | grep -qi intel && GPU_VENDOR="intel"
+
+echo "[HEY] gpu=$GPU_VENDOR"
+
+if [ "$GPU_VENDOR" = "nvidia" ]; then
+  install_pkg nvidia-detect
+  if command -v nvidia-detect >/dev/null 2>&1; then
+    REC="$(nvidia-detect | awk '/recommended/{print $NF}')"
+    [ -n "$REC" ] && install_pkg "$REC"
+  fi
+  install_pkg nvidia-utils nvidia-settings
+  install_pkg nvidia-cuda-toolkit cuda-toolkit cuda
+fi
+
+if [ "$GPU_VENDOR" = "amd" ]; then
+  install_pkg xserver-xorg-video-amdgpu mesa-vulkan-drivers mesa-va-drivers mesa-vdpau-drivers
+  install_pkg rocm-runtime rocm-utils rocm-dkms
+fi
+
+if [ "$GPU_VENDOR" = "intel" ]; then
+  install_pkg mesa-vulkan-drivers intel-media-va-driver intel-media-va-driver-non-free
+fi
+
+command -v systemctl >/dev/null 2>&1 && systemctl restart display-manager 2>/dev/null || true
+
+install_pkg tor proxychains4 proxychains-ng
+
+if pkg_installed tor; then
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl enable tor 2>/dev/null || true
+    systemctl start tor 2>/dev/null || true
+  else
+    tor >/dev/null 2>&1 &
+  fi
+fi
+
+PC_CONF="/etc/proxychains4.conf"
+[ -f "$PC_CONF" ] && cp "$PC_CONF" "$PC_CONF.bak.$(date +%s)" || true
+if [ -f "$PC_CONF" ]; then
+  sed -i 's/^#dynamic_chain/dynamic_chain/' "$PC_CONF"
+  sed -i 's/^strict_chain/#strict_chain/' "$PC_CONF"
+  sed -i 's/^#proxy_dns/proxy_dns/' "$PC_CONF"
+  grep -q "socks5 127.0.0.1 9050" "$PC_CONF" || echo "socks5 127.0.0.1 9050" >> "$PC_CONF"
+fi
+
+TOOLS_DIR="$HOME/tools"
+WL_DIR="$HOME/wordlists"
+SRC_DIR="$HOME/src"
+mkdir -p "$TOOLS_DIR" "$WL_DIR" "$SRC_DIR"
+
+install_pkg golang
+export GOPATH
